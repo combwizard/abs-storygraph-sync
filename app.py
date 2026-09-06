@@ -3,9 +3,9 @@ ABS to StoryGraph Sync Service
 """
 
 from flask import Flask, jsonify, request, render_template, session, redirect, url_for, g
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 from functools import wraps
-import os, re, json, logging, threading, time, uuid
+import os, re, json, logging, threading, time, uuid, html as html_lib
 from collections import deque
 from datetime import datetime, timezone
 import requests as req
@@ -247,13 +247,34 @@ def _item_to_book(item: dict, progress: dict) -> dict | None:
     title = metadata.get("title", "").strip()
     if not title:
         return None
+    author = (metadata.get("authorName") or "").strip()
+    if not author:
+        authors = metadata.get("authors") or []
+        names = []
+        for a in authors:
+            if isinstance(a, dict) and a.get("name"):
+                names.append(str(a["name"]).strip())
+            elif isinstance(a, str) and a.strip():
+                names.append(a.strip())
+        author = ", ".join(names)
+    narrators = metadata.get("narrators") or []
+    narrator_names = []
+    for n in narrators:
+        if isinstance(n, str) and n.strip():
+            narrator_names.append(n.strip())
+        elif isinstance(n, dict) and n.get("name"):
+            narrator_names.append(str(n["name"]).strip())
     return {
         "title": title,
-        "author": metadata.get("authorName", ""),
+        "author": author,
+        "prefer_audio": bool(narrator_names),
+        "narrators": narrator_names,
         "progress_percent": round((progress.get("progress") or 0) * 100, 1),
         "current_minutes": round((progress.get("currentTime") or 0) / 60, 1),
         "duration_minutes": round((media.get("duration") or 0) / 60, 1),
         "is_finished": bool(progress.get("isFinished")),
+        "finished_at": progress.get("finishedAt"),
+        "started_at": progress.get("startedAt"),
     }
 
 
@@ -371,24 +392,145 @@ class StoryGraphClient:
         resp = self._get("/")
         return "sign_in" not in resp.url
 
-    def search_book(self, title, author) -> str | None:
+    def search_book(
+        self,
+        title,
+        author,
+        prefer_audio: bool = False,
+        narrators: list | None = None,
+    ) -> str | None:
         query = req.utils.quote(f"{title} {author}".strip())
         resp = self._get(f"/browse?search_term={query}")
         if resp.status_code != 200:
             return None
         soup = BeautifulSoup(resp.text, "html.parser")
-        link = soup.find("a", class_="book-title-link")
-        if not link:
-            container = soup.find(class_="book-title-author-and-series")
-            if container:
-                link = container.find("a", href=re.compile(r"^/books/"))
-        if link:
+        title_l = title.casefold()
+        author_l = (author or "").casefold()
+        narrators = narrators or []
+        candidates = []
+        panes = soup.select("div.book-pane")
+        if not panes:
+            # Legacy markup fallback
+            link = soup.find("a", class_="book-title-link")
+            if not link:
+                container = soup.find(class_="book-title-author-and-series")
+                if container:
+                    link = container.find("a", href=re.compile(r"^/books/"))
+            if link:
+                m = re.search(r"/books/([^/?]+)", link.get("href", ""))
+                if m:
+                    book_id = m.group(1)
+                    if prefer_audio:
+                        book_id = self._prefer_audio_edition(book_id, narrators=narrators) or book_id
+                    logger.info("Found '%s' -> id=%s", title, book_id)
+                    return book_id
+            logger.warning("No StoryGraph result for '%s'", title)
+            return None
+
+        for pane in panes:
+            link = pane.find("a", href=re.compile(r"/books/[0-9a-f-]{8,}"))
+            if not link:
+                continue
             m = re.search(r"/books/([^/?]+)", link.get("href", ""))
-            if m:
-                logger.info("Found '%s' -> id=%s", title, m.group(1))
-                return m.group(1)
-        logger.warning("No StoryGraph result for '%s'", title)
-        return None
+            if not m:
+                continue
+            book_id = m.group(1)
+            ctx = " ".join(pane.get_text(" ", strip=True).split())
+            ctx_l = ctx.casefold()
+            score = 0
+            if title_l and title_l in ctx_l:
+                score += 50
+            if author_l and author_l in ctx_l:
+                score += 40
+            # Prefer series/number listings (usually the canonical work)
+            if re.search(r"#\d+", ctx):
+                score += 10
+            if re.search(r"\d+\s+editions?", ctx_l):
+                score += 5
+            if prefer_audio and re.search(r"\baudio\b", ctx_l) and "paperback" not in ctx_l:
+                score += 8
+            if "missing page info" in ctx_l:
+                score -= 15
+            candidates.append((score, book_id))
+
+        if not candidates:
+            logger.warning("No StoryGraph result for '%s'", title)
+            return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        best_score, book_id = candidates[0]
+        if best_score < 40:
+            logger.warning("Weak StoryGraph match for '%s' (score=%s)", title, best_score)
+        chosen = book_id
+        if prefer_audio:
+            chosen = self._prefer_audio_edition(book_id, narrators=narrators) or book_id
+        logger.info("Found '%s' -> id=%s", title, chosen)
+        return chosen
+
+    def _prefer_audio_edition(self, book_id: str, narrators: list | None = None) -> str | None:
+        """Prefer an Audio edition of this work, matching ABS narrator when possible."""
+        narrators_l = [n.casefold() for n in (narrators or []) if n]
+        try:
+            html = self._get(f"/books/{book_id}/editions").text
+        except Exception:
+            return book_id
+        soup = BeautifulSoup(html, "html.parser")
+        audio_ids = []
+        for pane in soup.select("div.book-pane"):
+            txt = " ".join(pane.get_text(" ", strip=True).split())
+            if not re.search(r"Format:\s*Audio\b", txt, re.I):
+                continue
+            link = pane.find("a", href=re.compile(r"/books/[0-9a-f-]{8,}"))
+            if not link:
+                continue
+            m = re.search(r"/books/([^/?]+)", link.get("href", ""))
+            if not m:
+                continue
+            bid = m.group(1)
+            txt_l = txt.casefold()
+            narrator_hit = any(n in txt_l for n in narrators_l)
+            audio_ids.append((2 if narrator_hit else 1, bid))
+        if not audio_ids:
+            return book_id
+        audio_ids.sort(key=lambda x: x[0], reverse=True)
+        return audio_ids[0][1]
+
+    def switch_edition_if_needed(self, to_book_id: str, html: str | None = None) -> tuple[bool, str | None]:
+        """If another edition holds the read status, POST /switch-editions to move it.
+        Returns (ok, html) — html is reusable page markup, or None when stale after a switch."""
+        page = html if html is not None else self.get_book_page(to_book_id)
+        if "currently reading another edition" not in page.casefold():
+            return True, page
+        try:
+            editions_html = self._get(f"/books/{to_book_id}/editions").text
+        except Exception:
+            return False, page
+        soup = BeautifulSoup(editions_html, "html.parser")
+        for form in soup.find_all("form", action=re.compile(r"/switch-editions")):
+            fields = {
+                inp.get("name"): inp.get("value")
+                for inp in form.find_all("input")
+                if inp.get("name")
+            }
+            if fields.get("to_book_id") != to_book_id:
+                continue
+            from_id = fields.get("from_book_id")
+            if not from_id:
+                continue
+            r = self._post(
+                "/switch-editions",
+                {
+                    "authenticity_token": fields.get("authenticity_token") or self._last_csrf,
+                    "from_book_id": from_id,
+                    "to_book_id": to_book_id,
+                },
+            )
+            logger.info(
+                "Switched edition %s -> %s: HTTP %s",
+                from_id[:8], to_book_id[:8], r.status_code,
+            )
+            return r.status_code in (200, 302), None
+        logger.warning("No /switch-editions form targeting %s", to_book_id[:8])
+        return False, page
 
     def get_book_page(self, book_id) -> str:
         return self._get(f"/books/{book_id}").text
@@ -399,13 +541,15 @@ class StoryGraphClient:
         None if it can't be found — callers should treat that as 'unknown' and not
         skip a write on its account."""
         m = re.search(
-            r'(?:name="read_status\[progress_number\]"|class="read-status-progress-number")[^>]*value="([^"]*)"',
+            r'(?:name="read_status\[progress_number\]"|class="[^"]*\bread-status-progress-number\b[^"]*")[^>]*value="([^"]*)"'
+            r'|value="([^"]*)"[^>]*(?:name="read_status\[progress_number\]"|class="[^"]*\bread-status-progress-number\b[^"]*")',
             html,
         )
-        if not m or not m.group(1):
+        raw = (m.group(1) or m.group(2)) if m else None
+        if not raw:
             return None
         try:
-            return float(m.group(1))
+            return float(raw)
         except ValueError:
             return None
 
@@ -415,7 +559,7 @@ class StoryGraphClient:
         the page markup the match was read from (reusable for a progress check), or None
         if a status-changing POST was made and any previously-fetched markup is now stale."""
         html = html if html is not None else self.get_book_page(book_id)
-        m = re.search(r'class="read-status-label"[^>]*>([^<]+)<', html)
+        m = re.search(r'class="[^"]*\bread-status-label\b[^"]*"[^>]*>([^<]*)<', html, re.I)
         current = m.group(1).strip().lower() if m else ""
         label = _STATUS_LABELS[target_status]
         if label in current or (target_status == "currently-reading" and "rereading" in current):
@@ -427,17 +571,122 @@ class StoryGraphClient:
         logger.info("Set status=%s for %s: HTTP %s", target_status, book_id, r.status_code)
         return r.status_code in (200, 302), False, None
 
+    def ensure_finish_date(
+        self,
+        book_id: str,
+        finished_at,
+        started_at=None,
+        html: str | None = None,
+    ) -> tuple[bool, str | None]:
+        """Set StoryGraph finish (and optional start) date from ABS timestamps.
+        Returns (ok, ymd) where ymd is YYYY-MM-DD of the finish date written/confirmed."""
+        finish = _abs_ts_to_ymd(finished_at)
+        if not finish:
+            return True, None
+        f_day, f_month, f_year = finish
+        finish_ymd = f"{f_year:04d}-{f_month:02d}-{f_day:02d}"
+        start = _abs_ts_to_ymd(started_at)
+        page = html if html is not None else self.get_book_page(book_id)
+        link = re.search(r'href="(/edit-read-instance-from-book\?[^"]+)"', page, re.I)
+        if not link:
+            logger.warning("No edit-read-instance link for %s", book_id)
+            return False, None
+        path = unquote(html_lib.unescape(link.group(1)))
+        form_html = self._get(path).text
+        instance_m = re.search(r'name="read_instance_id"[^>]*value="([^"]+)"', form_html) or re.search(
+            r'value="([^"]+)"[^>]*name="read_instance_id"', form_html
+        )
+        if not instance_m:
+            logger.warning("No read_instance_id on edit form for %s", book_id)
+            return False, None
+        instance_id = instance_m.group(1)
+
+        def _selected(name: str) -> str:
+            msel = re.search(
+                rf'<select[^>]*name="{re.escape(name)}"[^>]*>(.*?)</select>',
+                form_html,
+                flags=re.I | re.S,
+            )
+            if not msel:
+                return ""
+            sm = re.search(r'<option[^>]*selected[^>]*value="([^"]*)"', msel.group(1), re.I) or re.search(
+                r'<option[^>]*value="([^"]*)"[^>]*selected', msel.group(1), re.I
+            )
+            return sm.group(1) if sm else ""
+
+        existing = (
+            _selected("read_instance[year]"),
+            _selected("read_instance[month]"),
+            _selected("read_instance[day]"),
+        )
+        if existing == (str(f_year), str(f_month), str(f_day)):
+            return True, finish_ymd
+
+        payload = {
+            "_method": "patch",
+            "authenticity_token": self._last_csrf,
+            "book_id": book_id,
+            "read_instance_id": instance_id,
+            "read_instance[day]": str(f_day),
+            "read_instance[month]": str(f_month),
+            "read_instance[year]": str(f_year),
+            "read_instance[start_day]": str(start[0]) if start else "",
+            "read_instance[start_month]": str(start[1]) if start else "",
+            "read_instance[start_year]": str(start[2]) if start else "",
+            "commit": "Update",
+        }
+        r = self._session.post(
+            f"{STORYGRAPH_BASE}/read_instances/{instance_id}",
+            data=payload,
+            headers={
+                "X-CSRF-Token": self._last_csrf,
+                "Referer": f"{STORYGRAPH_BASE}{path}",
+                "Origin": STORYGRAPH_BASE,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            allow_redirects=True,
+            timeout=15,
+        )
+        # StoryGraph sometimes answers with an odd status; confirm via the edit form.
+        confirm_html = self._get(path).text
+
+        def _selected_after(name: str) -> str:
+            msel = re.search(
+                rf'<select[^>]*name="{re.escape(name)}"[^>]*>(.*?)</select>',
+                confirm_html,
+                flags=re.I | re.S,
+            )
+            if not msel:
+                return ""
+            sm = re.search(r'<option[^>]*selected[^>]*value="([^"]*)"', msel.group(1), re.I) or re.search(
+                r'<option[^>]*value="([^"]*)"[^>]*selected', msel.group(1), re.I
+            )
+            return sm.group(1) if sm else ""
+
+        confirmed = (
+            _selected_after("read_instance[year]"),
+            _selected_after("read_instance[month]"),
+            _selected_after("read_instance[day]"),
+        ) == (str(f_year), str(f_month), str(f_day))
+        ok = confirmed or r.status_code in (200, 302, 303)
+        logger.info(
+            "Finish date for %s -> %s: HTTP %s confirmed=%s",
+            book_id, finish_ymd, r.status_code, confirmed,
+        )
+        return ok, finish_ymd if ok else None
+
     def update_progress(self, book_id, progress_percent, html: str | None = None) -> bool:
         html = html if html is not None else self.get_book_page(book_id)
         m = re.search(
-            r'(?:name="read_status\[book_num_of_pages\]"|class="read-status-book-num-of-pages")[^>]*value="([^"]*)"',
+            r'(?:name="read_status\[book_num_of_pages\]"|class="[^"]*\bread-status-book-num-of-pages\b[^"]*")[^>]*value="([^"]*)"'
+            r'|value="([^"]*)"[^>]*(?:name="read_status\[book_num_of_pages\]"|class="[^"]*\bread-status-book-num-of-pages\b[^"]*")',
             html,
         )
-        book_pages = m.group(1) if m else "0"
+        book_pages = (m.group(1) or m.group(2)) if m else "0"
         r = self._post("/update-progress", {
             "read_status[progress_number]": str(round(progress_percent, 1)),
             "read_status[progress_type]": "percentage",
-            "read_status[book_num_of_pages]": book_pages,
+            "read_status[book_num_of_pages]": book_pages or "0",
             "book_id": book_id,
             "on_book_page": "true",
             "authenticity_token": self._last_csrf,
@@ -445,6 +694,19 @@ class StoryGraphClient:
         ok = r.status_code in (200, 302)
         logger.info("Progress for %s -> %.1f%%: HTTP %s", book_id, progress_percent, r.status_code)
         return ok
+
+
+def _abs_ts_to_ymd(ts) -> tuple[int, int, int] | None:
+    if ts is None or ts == "":
+        return None
+    try:
+        n = float(ts)
+        if n > 1e12:
+            n /= 1000.0
+        dt = datetime.fromtimestamp(n, timezone.utc)
+        return dt.day, dt.month, dt.year
+    except Exception:
+        return None
 
 # ── Sync logic ────────────────────────────────────────────────────────────────
 
@@ -492,16 +754,43 @@ def do_sync(user_id: str, books: list[dict]) -> list[dict]:
             pct = book["progress_percent"]
             status = _target_status(book)
             prev = synced.get(book["title"])
-            if prev is not None and prev.get("status") == status and abs(pct - prev.get("pct", -1)) < 0.5:
+            finish_parts = _abs_ts_to_ymd(book.get("finished_at")) if book.get("is_finished") else None
+            finish_ymd = (
+                f"{finish_parts[2]:04d}-{finish_parts[1]:02d}-{finish_parts[0]:02d}"
+                if finish_parts else None
+            )
+            needs_finish_date = bool(
+                status == "read"
+                and finish_ymd
+                and (prev or {}).get("finished_ymd") != finish_ymd
+            )
+            # Audiobooks without a stored StoryGraph edition id must re-run search
+            # so we can migrate off a previously synced print edition.
+            edition_stale = bool(book.get("prefer_audio")) and not (prev or {}).get("book_id")
+            status_unchanged = (
+                prev is not None
+                and prev.get("status") == status
+                and abs(pct - prev.get("pct", -1)) < 0.5
+            )
+            if status_unchanged and not needs_finish_date and not edition_stale:
                 logger.info("[%s] '%s' unchanged (%s, %.1f%%) — skipping", label, book["title"], status, pct)
                 results.append({"title": book["title"], "status": "unchanged", "progress_percent": pct})
                 continue
 
-            book_id = client.search_book(book["title"], book["author"])
+            book_id = client.search_book(
+                book["title"],
+                book["author"],
+                prefer_audio=bool(book.get("prefer_audio")),
+                narrators=book.get("narrators") or [],
+            )
             if not book_id:
                 results.append({"title": book["title"], "status": "not_found"})
                 continue
-            ok, already_matched, status_html = client.ensure_status(book_id, status)
+            switched_ok, status_html = client.switch_edition_if_needed(book_id)
+            if not switched_ok:
+                results.append({"title": book["title"], "status": "edition_switch_failed"})
+                continue
+            ok, already_matched, status_html = client.ensure_status(book_id, status, html=status_html)
             target_pct = 100 if status == "read" else pct
             # Skip the progress POST when StoryGraph already agrees with us. "read" is
             # always 100% by definition, so an already-matched read status is always
@@ -523,8 +812,23 @@ def do_sync(user_id: str, books: list[dict]) -> list[dict]:
             )
             if not skip_progress:
                 ok = client.update_progress(book_id, target_pct, html=status_html)
+            if ok and needs_finish_date:
+                date_ok, written_ymd = client.ensure_finish_date(
+                    book_id,
+                    book.get("finished_at"),
+                    started_at=book.get("started_at"),
+                    html=status_html,
+                )
+                ok = ok and date_ok
+                if date_ok and written_ymd:
+                    finish_ymd = written_ymd
             if ok:
-                synced[book["title"]] = {"pct": pct, "status": status}
+                entry = {"pct": pct, "status": status, "book_id": book_id}
+                if finish_ymd:
+                    entry["finished_ymd"] = finish_ymd
+                elif prev and prev.get("finished_ymd"):
+                    entry["finished_ymd"] = prev["finished_ymd"]
+                synced[book["title"]] = entry
                 _save_sync_state(user_id, synced)
             results.append({
                 "title": book["title"],
