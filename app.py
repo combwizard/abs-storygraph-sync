@@ -247,26 +247,34 @@ def _item_to_book(item: dict, progress: dict) -> dict | None:
     title = metadata.get("title", "").strip()
     if not title:
         return None
-    author = (metadata.get("authorName") or "").strip()
-    if not author:
-        authors = metadata.get("authors") or []
+    narrator_names = _people_names(metadata.get("narrators")) or _people_names(
+        metadata.get("narratorName")
+    )
+    author_names = _people_names(metadata.get("authors")) or _people_names(
+        metadata.get("authorName")
+    )
+    author_names = _strip_narrators_from_authors(author_names, narrator_names)
+    author = ", ".join(author_names)
+    asin = str(metadata.get("asin") or "").strip()
+    isbn = str(metadata.get("isbn") or metadata.get("isbn13") or "").strip()
+    series_name = str(metadata.get("seriesName") or "").strip()
+    if not series_name:
+        series = metadata.get("series") or []
         names = []
-        for a in authors:
-            if isinstance(a, dict) and a.get("name"):
-                names.append(str(a["name"]).strip())
-            elif isinstance(a, str) and a.strip():
-                names.append(a.strip())
-        author = ", ".join(names)
-    narrators = metadata.get("narrators") or []
-    narrator_names = []
-    for n in narrators:
-        if isinstance(n, str) and n.strip():
-            narrator_names.append(n.strip())
-        elif isinstance(n, dict) and n.get("name"):
-            narrator_names.append(str(n["name"]).strip())
+        for s in series:
+            if isinstance(s, dict) and s.get("name"):
+                names.append(str(s["name"]).strip())
+            elif isinstance(s, str) and s.strip():
+                names.append(s.strip())
+        series_name = ", ".join(names)
+    subtitle = str(metadata.get("subtitle") or "").strip()
     return {
         "title": title,
         "author": author,
+        "asin": asin,
+        "isbn": isbn,
+        "series_name": series_name,
+        "subtitle": subtitle,
         "prefer_audio": bool(narrator_names),
         "narrators": narrator_names,
         "progress_percent": round((progress.get("progress") or 0) * 100, 1),
@@ -341,6 +349,363 @@ _STATUS_LABELS = {
     "read": "read",
 }
 
+_AUTHOR_SPLIT = re.compile(r"\s*(?:,|&|\band\b)\s*", re.I)
+_AUTHOR_JUNK = {"jr", "sr", "ii", "iii", "iv", "phd", "md"}
+_LEADING_ARTICLE = re.compile(r"^(the|an|a)\s+")
+_PARENS = re.compile(r"\([^)]*\)")
+_NON_WORD = re.compile(r"[^\w\s]", re.UNICODE)
+_EDITION_LINK_TEXT = re.compile(r"^\d+\s+editions?$", re.I)
+# ABS/Audible often appends "Frontiers Saga Part 2" (and similar) onto the title.
+_TRAILING_SERIES = re.compile(
+    r"[\s,:\-]+(?:the\s+)?\S+[\s,:\-]+(?:saga|series)"
+    r"(?:[\s,:\-]+part\s+\d+)?"
+    r"(?:[\s,:\-]+(?:book|episode|ep\.?)\s+\d+)?"
+    r"$",
+    re.I,
+)
+_SERIES_ONLY_TITLE = re.compile(
+    r"^(?:the\s+)?\S+[\s,:\-]+(?:saga|series)(?:[\s,:\-]+part\s+\d+)?$",
+    re.I,
+)
+_TRAILING_BOOK_NUM = re.compile(
+    r"[\s,:\-]+(?:book|episode|ep\.?|vol(?:ume)?|part)\s+\d+$",
+    re.I,
+)
+_TRAILING_SERIES_KIND = re.compile(
+    r"[\s,:\-]+(?:the\s+)?(?:saga|series)$",
+    re.I,
+)
+
+
+def _normalize_book_title(title: str) -> str:
+    t = _PARENS.sub(" ", title or "")
+    t = _NON_WORD.sub(" ", t.casefold())
+    t = re.sub(r"\s+", " ", t).strip()
+    t = _LEADING_ARTICLE.sub("", t)
+    return t
+
+
+def _title_tokens(s: str) -> list[str]:
+    s = _NON_WORD.sub(" ", (s or "").casefold())
+    return [p for p in s.split() if p]
+
+
+def _drop_trailing_token_count(title: str, n: int) -> str:
+    parts = re.findall(r"\S+", (title or "").strip())
+    if n <= 0:
+        return (title or "").strip()
+    if n >= len(parts):
+        return ""
+    return " ".join(parts[:-n])
+
+
+def _contiguous_in(hay: list[str], needle: list[str]) -> bool:
+    n = len(needle)
+    if n == 0 or n > len(hay):
+        return False
+    return any(hay[i:i + n] == needle for i in range(len(hay) - n + 1))
+
+
+def _strip_series_from_title(title: str, series_name: str = "") -> str:
+    """Drop a trailing series name so StoryGraph search can use the real title.
+
+    ABS often stores 'Rebellion Frontiers Saga Part 2' with seriesName
+    'Frontiers Saga, Part 2: Rogue Castes #4'. StoryGraph's title is 'Rebellion'.
+    """
+    t = (title or "").strip()
+    if not t:
+        return ""
+    series = re.sub(r"#\s*\d+\s*$", "", series_name or "").strip()
+    st = _title_tokens(series)
+    if st:
+        tt = _title_tokens(t)
+        for n in range(min(len(tt), len(st)), 1, -1):
+            if _contiguous_in(st, tt[-n:]):
+                t = _drop_trailing_token_count(t, n)
+                break
+    trimmed = _TRAILING_SERIES.sub("", t).strip(" ,:-")
+    if trimmed:
+        t = trimmed
+    return t.strip(" ,:-")
+
+
+def _search_titles(title: str, series_name: str = "", subtitle: str = "") -> list[str]:
+    """Title strings to try against StoryGraph browse, best-first."""
+    title = (title or "").strip()
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(candidate: str):
+        c = (candidate or "").strip(" ,:-")
+        key = _normalize_book_title(c)
+        if not c or not key or key in seen:
+            return
+        seen.add(key)
+        out.append(c)
+
+    stripped = _strip_series_from_title(title, series_name)
+    series_only = (
+        not stripped
+        or bool(_SERIES_ONLY_TITLE.match(stripped))
+        or bool(_SERIES_ONLY_TITLE.match(title))
+    )
+    if stripped and not _SERIES_ONLY_TITLE.match(stripped):
+        add(stripped)
+    if series_only and subtitle:
+        sub = _TRAILING_BOOK_NUM.sub("", subtitle).strip(" ,:-")
+        sub = _TRAILING_SERIES_KIND.sub("", sub).strip(" ,:-")
+        add(_strip_series_from_title(sub, series_name))
+        add(sub)
+    add(title)
+    return out
+
+
+def _titles_compatible(abs_title: str, sg_title: str) -> bool:
+    """True when titles are the same work, not a substring of a different title.
+
+    'Roadkill' must not match 'Florida Roadkill'. Extra subtitle words on either
+    side are allowed ('Lock In' vs 'Lock In: A Novel').
+    """
+    a = _normalize_book_title(abs_title)
+    s = _normalize_book_title(sg_title)
+    if not a or not s:
+        return False
+    if a == s:
+        return True
+    return s.startswith(a + " ") or a.startswith(s + " ")
+
+
+def _author_last_names(author: str) -> list[str]:
+    names = []
+    for person in _AUTHOR_SPLIT.split(author or ""):
+        parts = [
+            p for p in _NON_WORD.sub(" ", person.casefold()).split()
+            if p and p not in _AUTHOR_JUNK and len(p) > 1
+        ]
+        if parts:
+            names.append(parts[-1])
+    return names
+
+
+def _people_names(value) -> list[str]:
+    """ABS people fields: 'A, B', ['A', 'B'], or [{name: 'A'}, ...]."""
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [p.strip() for p in _AUTHOR_SPLIT.split(value) if p and p.strip()]
+    if isinstance(value, list):
+        out = []
+        for item in value:
+            if isinstance(item, str):
+                out.extend(_people_names(item))
+            elif isinstance(item, dict) and item.get("name"):
+                out.extend(_people_names(str(item["name"])))
+        return out
+    return []
+
+
+def _person_key(name: str) -> str:
+    return re.sub(r"\s+", " ", _NON_WORD.sub(" ", (name or "").casefold())).strip()
+
+
+def _strip_narrators_from_authors(authors: list[str], narrators: list[str]) -> list[str]:
+    narr = {_person_key(n) for n in narrators if _person_key(n)}
+    if not narr:
+        return authors
+    kept = [a for a in authors if _person_key(a) not in narr]
+    return kept or authors
+
+
+def _search_authors(author: str) -> list[str]:
+    """Author strings to try in StoryGraph browse, best-first, ending with none."""
+    author = (author or "").strip()
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(candidate: str):
+        c = (candidate or "").strip()
+        key = c.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(c)
+
+    if author:
+        add(author)
+        people = _people_names(author)
+        if people:
+            add(people[0])
+    add("")
+    return out
+
+
+def _authors_compatible(abs_author: str, sg_author: str) -> bool:
+    if not (abs_author or "").strip():
+        return True
+    if not (sg_author or "").strip():
+        return False
+    sg = sg_author.casefold()
+    lasts = _author_last_names(abs_author)
+    if not lasts:
+        return abs_author.casefold() in sg
+    return any(re.search(rf"\b{re.escape(last)}\b", sg) for last in lasts)
+
+
+def _book_id_from_href(href: str | None) -> str | None:
+    if not href:
+        return None
+    m = re.search(r"/books/([^/?]+)", href)
+    return m.group(1) if m else None
+
+
+def _pane_title_author_id(pane) -> tuple[str, str, str | None]:
+    book_id = pane.get("data-book-id") or None
+    title = ""
+    block = pane.select_one(".book-title-author-and-series")
+    if block:
+        h3a = block.select_one("h3 a[href*='/books/']")
+        if h3a:
+            title = h3a.get_text(" ", strip=True)
+            book_id = book_id or _book_id_from_href(h3a.get("href"))
+    if not title:
+        for a in pane.select("a[href*='/books/']"):
+            href = a.get("href") or ""
+            if "/editions" in href:
+                continue
+            txt = a.get_text(" ", strip=True)
+            if txt and not _EDITION_LINK_TEXT.match(txt):
+                title = txt
+                book_id = book_id or _book_id_from_href(href)
+                break
+    author_el = pane.select_one("a[href*='/authors/']")
+    author = author_el.get_text(" ", strip=True) if author_el else ""
+    if not book_id:
+        link = pane.find("a", href=re.compile(r"/books/[0-9a-f-]{8,}"))
+        book_id = _book_id_from_href(link.get("href") if link else None)
+    return title, author, book_id
+
+
+def _match_titles(title: str, alt_titles: list | None = None) -> list[str]:
+    out = []
+    seen = set()
+    for t in [title, *(alt_titles or [])]:
+        t = (t or "").strip()
+        key = _normalize_book_title(t)
+        if t and key and key not in seen:
+            seen.add(key)
+            out.append(t)
+    return out
+
+
+def _pick_book_id_from_search(
+    soup,
+    title: str,
+    author: str = "",
+    identifiers: list | None = None,
+    alt_titles: list | None = None,
+) -> str | None:
+    """Pick a StoryGraph work from browse results, or None if nothing is safe.
+
+    Fail-closed: require an ASIN/ISBN hit, or compatible title AND author.
+    Title-only hits are never accepted when an author is known. Without an
+    author or identifier, only a single exact-title candidate is allowed.
+    """
+    identifiers = [i.strip() for i in (identifiers or []) if i and str(i).strip()]
+    idents_l = [i.casefold() for i in identifiers]
+    titles = _match_titles(title, alt_titles)
+    author = (author or "").strip()
+    panes = soup.select("div.book-pane")
+    candidates = []
+    for pane in panes:
+        sg_title, sg_author, book_id = _pane_title_author_id(pane)
+        if not book_id:
+            continue
+        ctx = " ".join(pane.get_text(" ", strip=True).split())
+        ctx_l = ctx.casefold()
+        ident_hit = any(i in ctx_l for i in idents_l)
+        title_ok = any(_titles_compatible(t, sg_title) for t in titles)
+        author_ok = bool(author) and bool(sg_author) and _authors_compatible(author, sg_author)
+        # Identifiers alone are enough; otherwise both title and author must agree.
+        if ident_hit:
+            pass
+        elif author:
+            if not (title_ok and author_ok):
+                continue
+        else:
+            # No author and no identifier: exact title only, disambiguated later.
+            if not title_ok:
+                continue
+        exact = any(_normalize_book_title(t) == _normalize_book_title(sg_title) for t in titles)
+        score = 0
+        if ident_hit:
+            score += 100
+        score += 50 if exact else 25
+        if author_ok:
+            score += 40
+        candidates.append((score, exact, book_id, sg_title, sg_author, ident_hit, author_ok))
+
+    if not panes:
+        link = soup.find("a", class_="book-title-link")
+        if not link:
+            container = soup.find(class_="book-title-author-and-series")
+            if container:
+                link = container.find("a", href=re.compile(r"^/books/"))
+        if link:
+            sg_title = link.get_text(" ", strip=True)
+            parent_txt = " ".join((link.parent.get_text(" ", strip=True) if link.parent else sg_title).split())
+            book_id = _book_id_from_href(link.get("href"))
+            ident_hit = any(i in parent_txt.casefold() for i in idents_l)
+            title_ok = any(_titles_compatible(t, sg_title) for t in titles)
+            author_ok = bool(author) and _authors_compatible(author, parent_txt)
+            if book_id and (ident_hit or (title_ok and (author_ok or not author))):
+                if author and not ident_hit and not author_ok:
+                    return None
+                if not author and not ident_hit:
+                    # Single-result page with no author: only exact title.
+                    if not any(_normalize_book_title(t) == _normalize_book_title(sg_title) for t in titles):
+                        return None
+                return book_id
+        return None
+
+    if not candidates:
+        return None
+
+    # Drop title-only soft matches when we have an author; keep ident / author hits.
+    if author:
+        strong = [c for c in candidates if c[5] or c[6]]  # ident_hit or author_ok
+        if not strong:
+            return None
+        candidates = strong
+    else:
+        # No author: require a unique exact title (or a unique ident hit).
+        exact_ids = {c[2] for c in candidates if c[1] or c[5]}
+        if len(exact_ids) != 1:
+            logger.warning(
+                "Ambiguous StoryGraph match for '%s' (no author, %d candidates), skipping",
+                title, len({c[2] for c in candidates}),
+            )
+            return None
+        return next(iter(exact_ids))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best = candidates[0]
+    # Refuse near-ties across different works.
+    tied = [c for c in candidates if c[0] == best[0] and c[2] != best[2]]
+    if tied:
+        logger.warning(
+            "Ambiguous StoryGraph match for '%s' (tied score %s), skipping",
+            title, best[0],
+        )
+        return None
+    # Soft title+author (non-exact, no ident) still needs the author bonus.
+    if not best[5] and not best[1] and best[0] < 65:
+        logger.warning(
+            "Weak StoryGraph match for '%s' (score=%s), skipping",
+            title, best[0],
+        )
+        return None
+    return best[2]
+
 
 class StoryGraphClient:
     def __init__(self, session_cookie: str, remember_token: str = ""):
@@ -398,71 +763,41 @@ class StoryGraphClient:
         author,
         prefer_audio: bool = False,
         narrators: list | None = None,
+        identifiers: list | None = None,
+        series_name: str = "",
+        subtitle: str = "",
     ) -> str | None:
-        query = req.utils.quote(f"{title} {author}".strip())
-        resp = self._get(f"/browse?search_term={query}")
-        if resp.status_code != 200:
-            return None
-        soup = BeautifulSoup(resp.text, "html.parser")
-        title_l = title.casefold()
-        author_l = (author or "").casefold()
-        narrators = narrators or []
-        candidates = []
-        panes = soup.select("div.book-pane")
-        if not panes:
-            # Legacy markup fallback
-            link = soup.find("a", class_="book-title-link")
-            if not link:
-                container = soup.find(class_="book-title-author-and-series")
-                if container:
-                    link = container.find("a", href=re.compile(r"^/books/"))
-            if link:
-                m = re.search(r"/books/([^/?]+)", link.get("href", ""))
-                if m:
-                    book_id = m.group(1)
-                    if prefer_audio:
-                        book_id = self._prefer_audio_edition(book_id, narrators=narrators) or book_id
-                    logger.info("Found '%s' -> id=%s", title, book_id)
-                    return book_id
+        # Identifiers (ASIN/ISBN) are used to score panes, not as search text.
+        # StoryGraph browse returns no book-panes for Audible ASINs like B0B6QBNK4J.
+        # ABS titles often include the series ("Rebellion Frontiers Saga Part 2");
+        # StoryGraph has nothing for that string, so retry with the core title.
+        # authorName often includes the narrator ("Andy Weir, Ray Porter"); that
+        # extra name also makes browse return zero hits, so retry a shorter author.
+        queries = _search_titles(title, series_name=series_name, subtitle=subtitle)
+        author_queries = _search_authors(author)
+        book_id = None
+        for qtitle in queries:
+            for qauthor in author_queries:
+                query = req.utils.quote(f"{qtitle} {qauthor}".strip())
+                resp = self._get(f"/browse?search_term={query}")
+                if resp.status_code != 200:
+                    continue
+                soup = BeautifulSoup(resp.text, "html.parser")
+                book_id = _pick_book_id_from_search(
+                    soup, title, author or "",
+                    identifiers=identifiers,
+                    alt_titles=queries,
+                )
+                if book_id:
+                    break
+            if book_id:
+                break
+        if not book_id:
             logger.warning("No StoryGraph result for '%s'", title)
             return None
-
-        for pane in panes:
-            link = pane.find("a", href=re.compile(r"/books/[0-9a-f-]{8,}"))
-            if not link:
-                continue
-            m = re.search(r"/books/([^/?]+)", link.get("href", ""))
-            if not m:
-                continue
-            book_id = m.group(1)
-            ctx = " ".join(pane.get_text(" ", strip=True).split())
-            ctx_l = ctx.casefold()
-            score = 0
-            if title_l and title_l in ctx_l:
-                score += 50
-            if author_l and author_l in ctx_l:
-                score += 40
-            # Prefer series/number listings (usually the canonical work)
-            if re.search(r"#\d+", ctx):
-                score += 10
-            if re.search(r"\d+\s+editions?", ctx_l):
-                score += 5
-            if prefer_audio and re.search(r"\baudio\b", ctx_l) and "paperback" not in ctx_l:
-                score += 8
-            if "missing page info" in ctx_l:
-                score -= 15
-            candidates.append((score, book_id))
-
-        if not candidates:
-            logger.warning("No StoryGraph result for '%s'", title)
-            return None
-        candidates.sort(key=lambda x: x[0], reverse=True)
-        best_score, book_id = candidates[0]
-        if best_score < 40:
-            logger.warning("Weak StoryGraph match for '%s' (score=%s)", title, best_score)
         chosen = book_id
         if prefer_audio:
-            chosen = self._prefer_audio_edition(book_id, narrators=narrators) or book_id
+            chosen = self._prefer_audio_edition(book_id, narrators=narrators or []) or book_id
         logger.info("Found '%s' -> id=%s", title, chosen)
         return chosen
 
@@ -782,6 +1117,9 @@ def do_sync(user_id: str, books: list[dict]) -> list[dict]:
                 book["author"],
                 prefer_audio=bool(book.get("prefer_audio")),
                 narrators=book.get("narrators") or [],
+                identifiers=[i for i in (book.get("asin"), book.get("isbn")) if i],
+                series_name=book.get("series_name") or "",
+                subtitle=book.get("subtitle") or "",
             )
             if not book_id:
                 results.append({"title": book["title"], "status": "not_found"})
